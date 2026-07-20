@@ -3,17 +3,17 @@
 ## 📌 Project Overview
 Data cleaning is a critical first step in the data analytics lifecycle. Raw, unrefined datasets often contain duplicate records, inconsistent formatting, structural anomalies, and missing values that can lead to skewed analyses and flawed business decisions.
 
-This project demonstrates a comprehensive end-to-end data cleaning workflow using **MySQL Workbench** on a real-world dataset covering global technological and corporate layoffs. The goal is to transform messy, unorganized raw data into a reliable, standardized, and production-ready staging environment suitable for exploratory data analysis (EDA) and reporting.
+This project demonstrates a comprehensive end-to-end data cleaning workflow using **MySQL Workbench** on a real-world dataset covering global technology and corporate layoffs. The goal is to transform messy, unorganized raw data into a reliable, standardized, production-ready staging table suitable for exploratory data analysis (EDA) and reporting.
 
 ---
 
 ## 🏗️ Architecture & Data Staging Strategy
 
-A primary rule of data engineering and database administration is **never modify raw data directly**. To preserve data lineage and maintain rollback capabilities, a multi-tier staging pipeline was implemented:
+A primary rule of data engineering is **never modify raw data directly**. To preserve data lineage and maintain rollback capability, a multi-tier staging pipeline was implemented:
 
-1. **`layoffs` (Raw Table):** Unmodified raw source data directly imported from the source CSV.
-2. **`layoffs_staging` (First Staging Tier):** An exact structural copy of the raw table used to begin structural transformations.
-3. **`layoffs_staging2` (Second Staging Tier):** An enhanced schema featuring helper metrics (such as window function outputs) to enable row-level operations (e.g., duplicate deletion) before finalized schema alterations.
+1. **`layoffs` (Raw Table):** Unmodified raw source data.
+2. **`layoffs_staging` (First Staging Tier):** An exact structural copy of the raw table, created to begin transformations safely.
+3. **`layoffs_staging2` (Second Staging Tier):** An enhanced schema with a helper `row_num` column (from a window function) to enable duplicate row deletion, later dropped once cleaning is complete.
 
 ---
 
@@ -21,34 +21,110 @@ A primary rule of data engineering and database administration is **never modify
 
 The data transformation pipeline follows five structured phases:
 
-### 1. Removing Duplicates
-Because the dataset lacked a unique primary key column, identifying true duplicates required comparing all attributes across records.
-* **Technique:** Leveraged MySQL's `ROW_NUMBER()` window function partitioned over every business field (`company`, `location`, `industry`, `total_laid_off`, `percentage_laid_off`, `date`, `stage`, `country`, `funds_raised_millions`).
-* **Execution:** Populated `layoffs_staging2` with computed row numbers and executed a targeted deletion for records where `row_num > 1`.
+### 1. Initial Database Setup & Staging
+```sql
+CREATE DATABASE IF NOT EXISTS world_layoffs;
+USE world_layoffs;
 
-### 2. Data Standardization
-Inconsistent string representations and formatting errors were cleaned to prepare the data for aggregation:
-* **Whitespace Trimming:** Applied `TRIM()` on textual fields like `company` to purge non-visible leading/trailing spaces.
-* **Industry Categorization:** Consolidated fragmented categories (e.g., standardizing `Crypto`, `Cryptocurrency`, and `Crypto Currency` under a uniform `'Crypto'` label).
-* **Geographical Cleanups:** Resolved trailing punctuation in country fields (e.g., correcting `'United States.'` to `'United States'`) using `TRIM(TRAILING '.' FROM country)`.
-* **Date Parsing & Schema Modification:** Transformed string representations of dates (`'MM/DD/YYYY'`) into standard MySQL date objects using `STR_TO_DATE()`, followed by modifying the column data type from `TEXT` to `DATE`.
+-- Create a staging table so raw data stays intact
+CREATE TABLE IF NOT EXISTS layoffs_staging LIKE layoffs;
+INSERT INTO layoffs_staging
+SELECT * FROM layoffs;
+```
 
-### 3. Handling Null & Blank Values
-Missing data was evaluated systematically to preserve maximum statistical utility:
-* **Empty String Normalization:** Converted empty string literals (`''`) to native SQL `NULL`s to facilitate conditional joins and aggregation behavior.
-* **Intelligent Data Imputation:** Executed a self-join (`JOIN`) matching on `company` and `location` to backfill missing `industry` records using valid entries from other layoff events by the same company.
-* **Controlled NULL Retention:** Preserved `NULL` values in numeric metrics (`total_laid_off`, `percentage_laid_off`) where baseline company sizes were unknown, avoiding arbitrary zeros that would distort future `AVG()` or distribution queries.
+### 2. Removing Duplicates
+Because the dataset lacked a unique primary key, true duplicates were identified by comparing all attributes across records.
 
-### 4. Row & Column Pruning
-To optimize query performance and data density:
-* **Irrelevant Record Deletion:** Deleted rows where **both** `total_laid_off` and `percentage_laid_off` were `NULL`, as these records provided no quantitative value for layoff analysis.
-* **Schema Refinement:** Dropped temporary windowing columns (`row_num`) via `ALTER TABLE ... DROP COLUMN` to leave a clean, normalized production schema.
+```sql
+-- Create second staging table with an added row_num column to allow row deletion
+CREATE TABLE IF NOT EXISTS `layoffs_staging2` (
+  `company` text,
+  `location` text,
+  `industry` text,
+  `total_laid_off` int DEFAULT NULL,
+  `percentage_laid_off` text,
+  `date` text,
+  `stage` text,
+  `country` text,
+  `funds_raised_millions` int DEFAULT NULL,
+  `row_num` INT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- Insert data into staging2 while computing row numbers to flag duplicates
+INSERT INTO layoffs_staging2
+SELECT *,
+  ROW_NUMBER() OVER (
+    PARTITION BY company, location, industry, total_laid_off, 
+                 percentage_laid_off, `date`, stage, country, funds_raised_millions
+  ) AS row_num
+FROM layoffs_staging;
+
+-- Delete flagged duplicate rows
+DELETE 
+FROM layoffs_staging2
+WHERE row_num > 1;
+```
+
+### 3. Data Standardization
+```sql
+-- 1. Trim leading and trailing whitespace from company names
+UPDATE layoffs_staging2
+SET company = TRIM(company);
+
+-- 2. Standardize industry names (e.g., 'Cryptocurrency' -> 'Crypto')
+UPDATE layoffs_staging2
+SET industry = 'Crypto'
+WHERE industry LIKE 'Crypto%';
+
+-- 3. Fix country names with trailing periods (e.g., 'United States.')
+UPDATE layoffs_staging2
+SET country = TRIM(TRAILING '.' FROM country)
+WHERE country LIKE 'United States%';
+
+-- 4. Convert text dates to MySQL DATE format and modify column type
+UPDATE layoffs_staging2
+SET `date` = STR_TO_DATE(`date`, '%m/%d/%Y');
+
+ALTER TABLE layoffs_staging2
+MODIFY COLUMN `date` DATE;
+```
+
+### 4. Handling Null & Blank Values
+```sql
+-- Convert empty string industries into NULLs so they can be populated
+UPDATE layoffs_staging2
+SET industry = NULL
+WHERE industry = '';
+
+-- Self-join to populate missing industry values from identical company entries
+UPDATE layoffs_staging2 t1
+JOIN layoffs_staging2 t2
+  ON t1.company = t2.company
+  AND t1.location = t2.location
+SET t1.industry = t2.industry
+WHERE t1.industry IS NULL
+  AND t2.industry IS NOT NULL;
+```
+
+### 5. Row & Column Pruning
+```sql
+-- Remove rows where both layoff metrics are missing (unusable for analysis)
+DELETE 
+FROM layoffs_staging2
+WHERE total_laid_off IS NULL
+  AND percentage_laid_off IS NULL;
+
+-- Drop the temporary row_num column created during duplicate removal
+ALTER TABLE layoffs_staging2
+DROP COLUMN row_num;
+
+-- Preview final cleaned dataset
+SELECT * FROM layoffs_staging2;
+```
 
 ---
 
 ## 🧰 Tech Stack & Tools Used
-* **Database Engine:** MySQL 8.0
-* **Management Tool:** MySQL Workbench
-* **SQL Concepts Applied:** Window Functions (`ROW_NUMBER()`, `PARTITION BY`), Self-Joins, String Manipulation (`TRIM`, `STR_TO_DATE`), DDL Operations (`ALTER TABLE`, `MODIFY`), Data Imputation, and CTEs.
-
----
+- **Database Engine:** MySQL 8.0
+- **Management Tool:** MySQL Workbench
+- **SQL Concepts Applied:** Window Functions (`ROW_NUMBER()`, `PARTITION BY`), Self-Joins, String Manipulation (`TRIM`, `STR_TO_DATE`), DDL Operations (`ALTER TABLE`, `MODIFY`), Data Imputation
